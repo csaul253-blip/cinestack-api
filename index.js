@@ -2,6 +2,11 @@ const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const { Pool } = require('pg');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const seedbox = require('./seedbox');
+
+const JWT_SECRET = process.env.JWT_SECRET || 'cinestack-dev-secret';
 
 dotenv.config();
 
@@ -17,38 +22,184 @@ const pool = new Pool({
   password: process.env.DB_PASSWORD,
 });
 
+// ─── Auth Routes ────────────────────────────────────────────────
+
+app.post('/api/auth/register', async (req, res) => {
+  const { email, password, role } = req.body;
+  try {
+    const hash = await bcrypt.hash(password, 10);
+    const result = await pool.query(
+      'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, role',
+      [email, hash, role || 'user']
+    );
+    res.json({ user: result.rows[0] });
+  } catch (err) {
+    if (err.code === '23505') return res.status(400).json({ error: 'Email already exists' });
+    res.status(500).json({ error: err.message });
+  }
+});
+app.get('/api/auth/demo', async (req, res) => {
+  try {
+    const result = await pool.query("SELECT id, email, display_name, role FROM users WHERE email = 'demo@cinestack.app'");
+    if (!result.rows[0]) return res.status(404).json({ error: 'Demo user not found' });
+    const user = result.rows[0];
+    const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, process.env.JWT_SECRET, { expiresIn: '2h' });
+    res.json({ token, display_name: user.display_name });
+  } catch (err) {
+    res.status(500).json({ error: 'Demo login failed' });
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+  try {
+    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    const user = result.rows[0];
+    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+    const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, user: { id: user.id, email: user.email, role: user.role, display_name: user.display_name || null } });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Profile Routes ──────────────────────────────────────────────
+
+app.patch('/api/auth/profile', requireAuth, async (req, res) => {
+  const { display_name } = req.body
+  try {
+    const result = await pool.query(
+      'UPDATE users SET display_name = $1 WHERE id = $2 RETURNING id, email, role, display_name',
+      [display_name, req.user.id]
+    )
+    res.json({ user: result.rows[0] })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.post('/api/auth/change-password', requireAuth, async (req, res) => {
+  const { currentPassword, newPassword } = req.body
+  try {
+    const result = await pool.query('SELECT * FROM users WHERE id = $1', [req.user.id])
+    const user = result.rows[0]
+    const valid = await bcrypt.compare(currentPassword, user.password_hash)
+    if (!valid) return res.status(401).json({ error: 'Current password is incorrect' })
+    const hash = await bcrypt.hash(newPassword, 10)
+    await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, req.user.id])
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─── Waitlist Route ──────────────────────────────────────────────
+
+app.post('/api/waitlist', async (req, res) => {
+  const { email, name } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email is required' });
+
+  try {
+    // Save to PostgreSQL
+    await pool.query(
+      'INSERT INTO waitlist (email, name) VALUES ($1, $2) ON CONFLICT (email) DO NOTHING',
+      [email, name || '']
+    );
+
+    // Add to Listmonk
+    await fetch('http://localhost:9000/api/subscribers', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Basic ' + Buffer.from('chris:Cms.206600.8217').toString('base64'),
+      },
+      body: JSON.stringify({
+        email,
+        name: name || email,
+        status: 'enabled',
+        lists: [3],
+      }),
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    // Still succeed if Listmonk fails — email is saved in DB
+    res.json({ success: true });
+  }
+});
+
+// ─── Auth Middleware ─────────────────────────────────────────────
+
+function requireAuth(req, res, next) {
+  const header = req.headers.authorization;
+  if (!header) return res.status(401).json({ error: 'No token' });
+  const token = header.split(' ')[1];
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+// ─── Settings helper ──────────────────────────────────────────────────────────
+async function getSettings() {
+  try {
+    const result = await pool.query('SELECT key, value FROM settings')
+    const settings = {}
+    result.rows.forEach(row => {
+      try { settings[row.key] = JSON.parse(row.value) }
+      catch { settings[row.key] = row.value }
+    })
+    return settings
+  } catch {
+    return {}
+  }
+}
+
 // ─── Radarr / Sonarr helpers ──────────────────────────────────────────────────
 
 async function radarrGet(path) {
-  const res = await fetch(`${process.env.RADARR_URL}/api/v3${path}`, {
-    headers: { 'X-Api-Key': process.env.RADARR_API_KEY }
-  });
-  return res.json();
+  const s = await getSettings()
+  const url = s.radarrUrl || process.env.RADARR_URL
+  const key = s.radarrApiKey || process.env.RADARR_API_KEY
+  const res = await fetch(`${url}/api/v3${path}`, {
+    headers: { 'X-Api-Key': key }
+  })
+  return res.json()
 }
-
 async function radarrPost(path, body) {
-  const res = await fetch(`${process.env.RADARR_URL}/api/v3${path}`, {
+  const s = await getSettings()
+  const url = s.radarrUrl || process.env.RADARR_URL
+  const key = s.radarrApiKey || process.env.RADARR_API_KEY
+  const res = await fetch(`${url}/api/v3${path}`, {
     method: 'POST',
-    headers: { 'X-Api-Key': process.env.RADARR_API_KEY, 'Content-Type': 'application/json' },
+    headers: { 'X-Api-Key': key, 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
-  });
-  return res.json();
+  })
+  return res.json()
 }
-
 async function sonarrGet(path) {
-  const res = await fetch(`${process.env.SONARR_URL}/api/v3${path}`, {
-    headers: { 'X-Api-Key': process.env.SONARR_API_KEY }
-  });
-  return res.json();
+  const s = await getSettings()
+  const url = s.sonarrUrl || process.env.SONARR_URL
+  const key = s.sonarrApiKey || process.env.SONARR_API_KEY
+  const res = await fetch(`${url}/api/v3${path}`, {
+    headers: { 'X-Api-Key': key }
+  })
+  return res.json()
 }
-
 async function sonarrPost(path, body) {
-  const res = await fetch(`${process.env.SONARR_URL}/api/v3${path}`, {
+  const s = await getSettings()
+  const url = s.sonarrUrl || process.env.SONARR_URL
+  const key = s.sonarrApiKey || process.env.SONARR_API_KEY
+  const res = await fetch(`${url}/api/v3${path}`, {
     method: 'POST',
-    headers: { 'X-Api-Key': process.env.SONARR_API_KEY, 'Content-Type': 'application/json' },
+    headers: { 'X-Api-Key': key, 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
-  });
-  return res.json();
+  })
+  return res.json()
 }
 
 async function addToRadarr(title, tmdbId) {
@@ -217,6 +368,126 @@ app.delete('/api/requests/:id', async (req, res) => {
   }
 });
 
+// ─── Settings ─────────────────────────────────────────────────────────────────
+
+app.get('/api/settings', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT key, value FROM settings')
+    const settings = {}
+    result.rows.forEach(row => {
+      try { settings[row.key] = JSON.parse(row.value) }
+      catch { settings[row.key] = row.value }
+    })
+    res.json(settings)
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.post('/api/settings', requireAuth, async (req, res) => {
+  try {
+    const entries = Object.entries(req.body)
+    for (const [key, value] of entries) {
+      await pool.query(
+        `INSERT INTO settings (key, value, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
+        [key, JSON.stringify(value)]
+      )
+    }
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─── Seedbox ──────────────────────────────────────────────────────────────────
+
+app.get('/api/settings/seedbox', requireAuth, async (req, res) => {
+  try {
+    const cfg = await seedbox.getSeedboxConfig();
+    res.json(seedbox.publicConfig(cfg));
+  } catch (err) {
+    console.error('GET /api/settings/seedbox error');
+    res.status(500).json({ error: 'Failed to load seedbox settings' });
+  }
+});
+
+app.post('/api/settings/seedbox', requireAuth, async (req, res) => {
+  try {
+    await seedbox.saveSeedboxConfig(req.body);
+    seedbox.stopPoller();
+    if (req.body.enabled === true || req.body.enabled === 'true') {
+      seedbox.startPoller(60);
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('POST /api/settings/seedbox error');
+    res.status(400).json({ error: err.message || 'Failed to save seedbox settings' });
+  }
+});
+
+app.get('/api/seedbox/status', requireAuth, (req, res) => {
+  res.json(seedbox.getState());
+});
+
+app.post('/api/seedbox/test', requireAuth, async (req, res) => {
+  try {
+    const { host, port, username, password, remotePath } = req.body;
+    const result = await seedbox.testConnection({ host, port, username, password, remotePath });
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err.message || 'Connection failed' });
+  }
+});
+
+// ─── Jellyfin ─────────────────────────────────────────────────────────────────
+app.get('/api/jellyfin/find', async (req, res) => {
+  const { tmdb_id, type } = req.query
+  const itemType = type === 'tv' ? 'Series' : 'Movie'
+  try {
+    const response = await fetch(
+      `${process.env.JELLYFIN_URL}/Items?AnyProviderIdEquals=tmdb.${tmdb_id}&IncludeItemTypes=${itemType}&Recursive=true`,
+      { headers: { 'X-Emby-Token': process.env.JELLYFIN_API_KEY } }
+    )
+    const data = await response.json()
+    const item = data.Items?.[0]
+    if (item) {
+      res.json({ found: true, jellyfin_id: item.Id })
+    } else {
+      res.json({ found: false })
+    }
+  } catch (err) {
+    res.json({ found: false })
+  }
+})
+
+app.get('/api/jellyfin/movies', async (req, res) => {
+  try {
+    const response = await fetch(
+      `${process.env.JELLYFIN_URL}/Items?IncludeItemTypes=Movie&Recursive=true&Fields=Overview,ProviderIds,BackdropImageTags,ImageTags`,
+      { headers: { 'X-Emby-Token': process.env.JELLYFIN_API_KEY } }
+    )
+    const data = await response.json()
+    res.json(data.Items || [])
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.get('/api/jellyfin/tv', async (req, res) => {
+  try {
+    const response = await fetch(
+      `${process.env.JELLYFIN_URL}/Items?IncludeItemTypes=Series&Recursive=true&Fields=Overview,ProviderIds,BackdropImageTags,ImageTags`,
+      { headers: { 'X-Emby-Token': process.env.JELLYFIN_API_KEY } }
+    )
+    const data = await response.json()
+    res.json(data.Items || [])
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
 // ─── Downloads ────────────────────────────────────────────────────────────────
 app.get('/api/downloads', async (req, res) => {
   try {
@@ -298,3 +569,5 @@ const PORT = process.env.PORT || 3004;
 app.listen(PORT, () => {
   console.log(`CineStack API running on port ${PORT}`);
 });
+seedbox.init(pool);
+seedbox.startPoller(60);
