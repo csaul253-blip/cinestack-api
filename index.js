@@ -26,18 +26,20 @@ const pool = new Pool({
 // ─── Auth Routes ────────────────────────────────────────────────
 
 app.post('/api/auth/register', async (req, res) => {
-  const { email, password } = req.body;
+  const { email, password, display_name, role } = req.body;
   try {
     const countResult = await pool.query('SELECT COUNT(*) FROM users');
     const isFirstUser = parseInt(countResult.rows[0].count) === 0;
-    const role = isFirstUser ? 'admin' : 'user';
+    const assignedRole = isFirstUser ? 'admin' : (role || 'user');
 
     const hash = await bcrypt.hash(password, 10);
     const result = await pool.query(
-      'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, role',
-      [email, hash, role]
+      'INSERT INTO users (email, password_hash, role, display_name) VALUES ($1, $2, $3, $4) RETURNING id, email, role, display_name',
+      [email, hash, assignedRole, display_name || null]
     );
-    res.json({ user: result.rows[0] });
+    const user = result.rows[0];
+    const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, user });
   } catch (err) {
     if (err.code === '23505') return res.status(400).json({ error: 'Email already exists' });
     res.status(500).json({ error: err.message });
@@ -290,6 +292,71 @@ async function addToSonarr(title, tmdbId) {
 }
 
 // ─── Health ───────────────────────────────────────────────────────────────────
+
+app.get('/api/setup/status', async (req, res) => {
+  const result = await pool.query(
+    `SELECT value FROM settings WHERE key = 'setup_complete'`
+  );
+  res.json({ complete: result.rows.length > 0 && result.rows[0].value === 'true' });
+});
+
+app.post('/api/setup/test-connection', async (req, res) => {
+  const { type, url, apiKey } = req.body;
+  if (!url || !apiKey) {
+    return res.status(400).json({ success: false, error: 'URL and API key are required.' });
+  }
+  try {
+    await axios.get(`${url}/api/v1/system/status`, {
+      headers: { 'X-Api-Key': apiKey },
+      timeout: 5000,
+    });
+    res.json({ success: true });
+  } catch (err) {
+    const msg = err.response
+      ? `HTTP ${err.response.status} — check your URL and API key`
+      : err.code === 'ECONNREFUSED'
+      ? 'Connection refused — is the service running?'
+      : err.message;
+    res.json({ success: false, error: msg });
+  }
+});
+
+app.post('/api/setup/save', async (req, res) => {
+  const allowed = [
+    'radarr_url', 'radarr_api_key',
+    'sonarr_url', 'sonarr_api_key',
+    'prowlarr_url', 'prowlarr_api_key',
+    'jellyfin_url', 'jellyfin_api_key',
+  ];
+  try {
+    const entries = Object.entries(req.body).filter(([key]) => allowed.includes(key));
+    for (const [key, value] of entries) {
+      await pool.query(
+        `INSERT INTO settings (key, value, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
+        [key, value]
+      );
+    }
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/setup/complete', async (req, res) => {
+  try {
+    await pool.query(
+      `INSERT INTO settings (key, value, updated_at)
+       VALUES ('setup_complete', 'true', NOW())
+       ON CONFLICT (key) DO UPDATE SET value = 'true', updated_at = NOW()`
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.get('/api/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
@@ -641,10 +708,63 @@ app.get('/api/tmdb/*path', async (req, res) => {
     res.status(status).json({ error: message });
   }
 });
-
+async function runMigrations() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      email VARCHAR(255) UNIQUE NOT NULL,
+      password_hash VARCHAR(255) NOT NULL,
+      role VARCHAR(50) DEFAULT 'user',
+      display_name VARCHAR(255),
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS requests (
+      id SERIAL PRIMARY KEY,
+      title VARCHAR(255) NOT NULL,
+      type VARCHAR(50) NOT NULL,
+      status VARCHAR(50) DEFAULT 'pending',
+      progress INTEGER DEFAULT 0,
+      tmdb_id INTEGER,
+      poster_path VARCHAR(255),
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS downloads (
+      id SERIAL PRIMARY KEY,
+      title VARCHAR(255) NOT NULL,
+      type VARCHAR(50) NOT NULL,
+      status VARCHAR(50) DEFAULT 'queued',
+      progress INTEGER DEFAULT 0,
+      speed VARCHAR(50),
+      eta VARCHAR(50),
+      file_size VARCHAR(50),
+      tmdb_id INTEGER,
+      poster_path VARCHAR(255),
+      request_id INTEGER REFERENCES requests(id),
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS waitlist (
+      id SERIAL PRIMARY KEY,
+      email VARCHAR(255) UNIQUE NOT NULL,
+      name VARCHAR(255),
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS settings (
+      id SERIAL PRIMARY KEY,
+      key VARCHAR(255) UNIQUE NOT NULL,
+      value TEXT,
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  console.log('Migrations complete.');
+}
 const PORT = process.env.PORT || 3004;
-app.listen(PORT, () => {
-  console.log(`CineStack API running on port ${PORT}`);
+runMigrations().then(() => {
+  app.listen(PORT, () => {
+    console.log(`CineStack API running on port ${PORT}`);
+    seedbox.init(pool);
+    seedbox.startPoller(60);
+  });
+}).catch(err => {
+  console.error('Migration failed:', err);
+  process.exit(1);
 });
-seedbox.init(pool);
-seedbox.startPoller(60);
