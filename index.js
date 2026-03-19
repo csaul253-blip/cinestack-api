@@ -5,6 +5,7 @@ const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const seedbox = require('./seedbox');
+const axios = require('axios');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'cinestack-dev-secret';
 
@@ -25,12 +26,16 @@ const pool = new Pool({
 // ─── Auth Routes ────────────────────────────────────────────────
 
 app.post('/api/auth/register', async (req, res) => {
-  const { email, password, role } = req.body;
+  const { email, password } = req.body;
   try {
+    const countResult = await pool.query('SELECT COUNT(*) FROM users');
+    const isFirstUser = parseInt(countResult.rows[0].count) === 0;
+    const role = isFirstUser ? 'admin' : 'user';
+
     const hash = await bcrypt.hash(password, 10);
     const result = await pool.query(
       'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, role',
-      [email, hash, role || 'user']
+      [email, hash, role]
     );
     res.json({ user: result.rows[0] });
   } catch (err) {
@@ -113,7 +118,7 @@ app.post('/api/waitlist', async (req, res) => {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': 'Basic ' + Buffer.from('chris:Cms.206600.8217').toString('base64'),
+        'Authorization': 'Basic ' + Buffer.from(process.env.LISTMONK_API_USER + ':' + process.env.LISTMONK_API_TOKEN).toString('base64'),
       },
       body: JSON.stringify({
         email,
@@ -521,49 +526,121 @@ app.delete('/api/downloads/:id', async (req, res) => {
   }
 });
 
-// ─── Progress Simulator ───────────────────────────────────────────────────────
-setInterval(async () => {
+// ─── Real Download Queue Poller ───────────────────────────────────────────────
+async function syncDownloadQueue() {
   try {
-    const activeResult = await pool.query(
-      "SELECT COUNT(*) FROM downloads WHERE status = 'downloading'"
+    const [radarrRes, sonarrRes] = await Promise.allSettled([
+      radarrGet('/queue?pageSize=100&includeUnknownMovieItems=false'),
+      sonarrGet('/queue?pageSize=100&includeUnknownSeriesItems=false'),
+    ]);
+
+    const radarrRecords = radarrRes.status === 'fulfilled' ? (radarrRes.value?.records || []) : [];
+    const sonarrRecords = sonarrRes.status === 'fulfilled' ? (sonarrRes.value?.records || []) : [];
+    const allRecords = [...radarrRecords, ...sonarrRecords];
+
+    const dbResult = await pool.query(
+      "SELECT * FROM downloads WHERE status NOT IN ('completed', 'failed')"
     );
-    const activeCount = parseInt(activeResult.rows[0].count);
+    const dbDownloads = dbResult.rows;
+    const matchedIds = new Set();
 
-    if (activeCount === 0) {
-      await pool.query(
-        `UPDATE downloads SET status = 'downloading', speed = '12.4 MB/s', eta = 'Calculating...'
-         WHERE id = (SELECT id FROM downloads WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1)`
-      );
-    }
+    for (const record of allRecords) {
+      const dbMatch = dbDownloads.find(dl => {
+        const recordTitle = (record.title || record.series?.title || '').toLowerCase();
+        const dlTitle = (dl.title || '').toLowerCase();
+        return dlTitle && recordTitle && (
+          recordTitle.includes(dlTitle) || dlTitle.includes(recordTitle)
+        );
+      });
 
-    const downloading = await pool.query(
-      "SELECT * FROM downloads WHERE status = 'downloading'"
-    );
+      if (!dbMatch) continue;
+      matchedIds.add(dbMatch.id);
 
-    for (const dl of downloading.rows) {
-      const increment = Math.floor(Math.random() * 5) + 3;
-      const newProgress = Math.min(dl.progress + increment, 100);
-      const speed = `${(Math.random() * 15 + 5).toFixed(1)} MB/s`;
-      const remaining = Math.ceil((100 - newProgress) / increment * 4);
-      const eta = newProgress >= 100 ? null : remaining < 60 ? `${remaining}s` : `${Math.ceil(remaining / 60)}m`;
-      const status = newProgress >= 100 ? 'completed' : 'downloading';
+      const size = record.size || 0;
+      const sizeleft = record.sizeleft || 0;
+      const progress = size > 0 ? Math.round(((size - sizeleft) / size) * 100) : 0;
+
+      let speed = null;
+      if (record.timeleft && sizeleft > 0) {
+        const parts = record.timeleft.split(':').map(Number);
+        const secondsLeft = (parts[0] * 3600) + (parts[1] * 60) + (parts[2] || 0);
+        if (secondsLeft > 0) {
+          const mbps = (sizeleft / secondsLeft / 1024 / 1024).toFixed(1);
+          speed = `${mbps} MB/s`;
+        }
+      }
+
+      let eta = null;
+      if (record.timeleft) {
+        const parts = record.timeleft.split(':').map(Number);
+        const h = parts[0], m = parts[1], s = parts[2] || 0;
+        if (h > 0) eta = `${h}h ${m}m`;
+        else if (m > 0) eta = `${m}m ${s}s`;
+        else eta = `${s}s`;
+      }
+
+      const tracked = record.trackedDownloadState || '';
+      const status = record.status || '';
+      let csStatus = 'downloading';
+      if (tracked === 'importPending' || tracked === 'imported') csStatus = 'completed';
+      else if (status === 'paused') csStatus = 'queued';
+      else if (tracked === 'downloadFailed' || status === 'failed') csStatus = 'failed';
 
       await pool.query(
         `UPDATE downloads SET progress = $1, speed = $2, eta = $3, status = $4 WHERE id = $5`,
-        [newProgress, status === 'completed' ? null : speed, eta, status, dl.id]
+        [progress, speed, eta, csStatus, dbMatch.id]
       );
 
-      if (status === 'completed' && dl.request_id) {
+      if (csStatus === 'completed' && dbMatch.request_id) {
+        await pool.query(
+          "UPDATE requests SET status = 'available', progress = 100 WHERE id = $1",
+          [dbMatch.request_id]
+        );
+      }
+    }
+
+    const unmatched = dbDownloads.filter(
+      dl => !matchedIds.has(dl.id) && dl.status === 'downloading' && dl.progress > 0
+    );
+    for (const dl of unmatched) {
+      await pool.query(
+        "UPDATE downloads SET status = 'completed', progress = 100, speed = NULL, eta = NULL WHERE id = $1",
+        [dl.id]
+      );
+      if (dl.request_id) {
         await pool.query(
           "UPDATE requests SET status = 'available', progress = 100 WHERE id = $1",
           [dl.request_id]
         );
       }
     }
+
   } catch (err) {
-    console.error('Simulator error:', err.message);
+    console.error('[Queue Poller] Error:', err.message);
   }
-}, 4000);
+}
+
+setInterval(syncDownloadQueue, 10000);
+
+// TMDB proxy
+app.get('/api/tmdb/*path', async (req, res) => {
+  try {
+    const tmdbPath = Array.isArray(req.params.path) ? req.params.path.join('/') : req.params.path;
+    const query = new URLSearchParams(req.query).toString();
+    const url = `https://api.themoviedb.org/3/${tmdbPath}${query ? '?' + query : ''}`;
+    const response = await axios.get(url, {
+      headers: {
+        Authorization: `Bearer ${process.env.TMDB_API_TOKEN}`,
+        accept: 'application/json',
+      },
+    });
+    res.json(response.data);
+  } catch (err) {
+    const status = err.response?.status || 500;
+    const message = err.response?.data?.status_message || 'TMDB proxy error';
+    res.status(status).json({ error: message });
+  }
+});
 
 const PORT = process.env.PORT || 3004;
 app.listen(PORT, () => {
